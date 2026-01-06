@@ -29,17 +29,17 @@ def extract_from_tables(pdf: pdfplumber.PDF):
     rows = []
     warnings = []
 
-    table_settings = {
+        table_settings = {
         "vertical_strategy": "lines",
         "horizontal_strategy": "lines",
-        "intersection_tolerance": 5,
-        "snap_tolerance": 3,
-        "join_tolerance": 3,
-        "edge_min_length": 3,
-        "min_words_vertical": 1,
-        "min_words_horizontal": 1,
-        "keep_blank_chars": False,
     }
+
+    for page_idx, page in enumerate(pdf.pages, start=1):
+        try:
+            tables = page.extract_tables(table_settings=table_settings) or []
+        except Exception as e:
+            warnings.append(f"Página {page_idx}: erro lendo tabela ({type(e).__name__}). Vou usar fallback por texto.")
+            tables = []
 
     for page_idx, page in enumerate(pdf.pages, start=1):
         tables = page.extract_tables(table_settings=table_settings) or []
