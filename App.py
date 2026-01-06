@@ -8,72 +8,164 @@ import pdfplumber
 st.set_page_config(page_title="Extrator SKU x Unidades", page_icon="📄", layout="centered")
 
 st.title("📄 Extrator de SKU x UNIDADES (PDF → Planilha)")
-st.write(
-    "Envie um PDF no padrão de lista (com campos **SKU:** e coluna **UNIDADES**) "
-    "para gerar uma planilha com **SKU** e **UNIDADES**."
-)
+st.write("Envie um PDF para extrair **SKU** e **UNIDADES** na ordem em que aparecem no documento.")
 
 SKU_REGEX = re.compile(r"SKU:\s*([A-Za-z0-9]+)", re.IGNORECASE)
 
-def extract_skus_in_order(page_text):
-    return [m.group(1).strip() for m in SKU_REGEX.finditer(page_text or "")]
+def parse_int(value):
+    """Extrai inteiro de um texto (ex.: ' 3 ' -> 3). Retorna None se não achar."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    m = re.search(r"\b(\d+)\b", s)
+    return int(m.group(1)) if m else None
 
-def extract_units_after_header(page_text):
-    if not page_text:
-        return []
-
-    upper = page_text.upper()
-    idx = upper.rfind("PRODUTO UNIDADES")
-    if idx == -1:
-        idx = upper.rfind("UNIDADES")
-        if idx == -1:
-            return []
-
-    tail = page_text[idx:]
-    nums = re.findall(r"\b\d+\b", tail)
-    return [int(n) for n in nums]
-
-def parse_pdf(file_bytes):
+def extract_from_tables(pdf: pdfplumber.PDF):
+    """
+    Extrai preservando a ordem do PDF via tabelas:
+    - SKU vem da coluna PRODUTO (contém 'SKU: ...')
+    - UNIDADES vem da coluna UNIDADES
+    """
     rows = []
     warnings = []
 
-    with pdfplumber.open(BytesIO(file_bytes)) as pdf:
-        for page_idx, page in enumerate(pdf.pages, start=1):
-            text = page.extract_text() or ""
+    table_settings = {
+        "vertical_strategy": "lines",
+        "horizontal_strategy": "lines",
+        "intersection_tolerance": 5,
+        "snap_tolerance": 3,
+        "join_tolerance": 3,
+        "edge_min_length": 3,
+        "min_words_vertical": 1,
+        "min_words_horizontal": 1,
+        "keep_blank_chars": False,
+    }
 
-            skus = extract_skus_in_order(text)
-            units = extract_units_after_header(text)
+    for page_idx, page in enumerate(pdf.pages, start=1):
+        tables = page.extract_tables(table_settings=table_settings) or []
+        if not tables:
+            warnings.append(f"Página {page_idx}: não consegui ler tabela (vou tentar fallback por texto).")
+            continue
 
-            if not skus:
+        for table in tables:
+            if not table or len(table) < 2:
                 continue
 
-            if len(units) < len(skus):
-                warnings.append(
-                    f"Página {page_idx}: {len(skus)} SKU(s) e apenas {len(units)} unidade(s)."
-                )
-            elif len(units) > len(skus):
-                units = units[: len(skus)]
+            # Detecta header (primeira linha) e tenta localizar colunas
+            header = [("" if c is None else str(c)).strip().upper() for c in table[0]]
 
-            for i, sku in enumerate(skus):
-                rows.append({
-                    "page": page_idx,
-                    "sku": sku,
-                    "unidades": units[i] if i < len(units) else None
-                })
+            # Normalmente: PRODUTO | UNIDADES | IDENTIFICAÇÃO | ...
+            try:
+                produto_col = header.index("PRODUTO")
+            except ValueError:
+                produto_col = 0  # fallback
 
-    df = pd.DataFrame(rows)
+            # UNIDADES pode vir com espaços/variações; tenta achar por contains
+            unidades_col = None
+            for i, h in enumerate(header):
+                if "UNIDADE" in h:
+                    unidades_col = i
+                    break
+            if unidades_col is None:
+                unidades_col = 1  # fallback comum
+
+            # Percorre linhas mantendo ordem
+            for r in table[1:]:
+                if not r or len(r) <= max(produto_col, unidades_col):
+                    continue
+
+                produto_cell = r[produto_col]
+                unidades_cell = r[unidades_col]
+
+                if produto_cell is None:
+                    continue
+
+                produto_text = str(produto_cell)
+
+                msku = SKU_REGEX.search(produto_text)
+                if not msku:
+                    continue
+
+                sku = msku.group(1).strip()
+                unidades = parse_int(unidades_cell)
+
+                rows.append({"page": page_idx, "sku": sku, "unidades": unidades})
+
+    return pd.DataFrame(rows), warnings
+
+def extract_fallback_text(pdf: pdfplumber.PDF):
+    """
+    Fallback: por texto, mas com pareamento por ocorrência de SKU e a UNIDADE
+    mais próxima na mesma seção de tabela, reduzindo contaminação.
+    Só entra se a extração por tabela falhar.
+    """
+    rows = []
+    warnings = []
+
+    for page_idx, page in enumerate(pdf.pages, start=1):
+        text = page.extract_text() or ""
+        if not text:
+            continue
+
+        # Divide a partir do cabeçalho para pegar a parte "tabela"
+        up = text.upper()
+        cut = up.find("PRODUTO")
+        table_text = text[cut:] if cut != -1 else text
+
+        # Captura SKUs na ordem
+        skus = [m.group(1).strip() for m in SKU_REGEX.finditer(table_text)]
+        if not skus:
+            continue
+
+        # Captura candidatos a unidades: números isolados em linhas mais “curtas”
+        # (tenta evitar pegar códigos universais grandes e descrições)
+        candidates = []
+        for line in table_text.splitlines():
+            line_stripped = line.strip()
+            if not line_stripped:
+                continue
+            # linha com apenas número (ou quase)
+            if re.fullmatch(r"\d{1,4}", line_stripped):
+                candidates.append(int(line_stripped))
+
+        if len(candidates) < len(skus):
+            warnings.append(
+                f"Página {page_idx} (fallback): {len(skus)} SKU(s), {len(candidates)} unidade(s)."
+            )
+
+        for i, sku in enumerate(skus):
+            unidades = candidates[i] if i < len(candidates) else None
+            rows.append({"page": page_idx, "sku": sku, "unidades": unidades})
+
+    return pd.DataFrame(rows), warnings
+
+def parse_pdf(file_bytes: bytes):
+    warns = []
+    with pdfplumber.open(BytesIO(file_bytes)) as pdf:
+        df, w1 = extract_from_tables(pdf)
+        warns += w1
+
+        # Se falhou (vazio ou muitas unidades None), usa fallback
+        if df.empty or df["unidades"].isna().mean() > 0.5:
+            df2, w2 = extract_fallback_text(pdf)
+            warns += w2
+            if not df2.empty:
+                df = df2
+
     if df.empty:
-        warnings.append("Não foi possível extrair dados do PDF.")
+        warns.append("Não consegui extrair dados. Verifique se o PDF é texto (não imagem/scan).")
 
-    return df, warnings
+    # IMPORTANTÍSSIMO: NÃO ordena por SKU (mantém ordem do PDF)
+    df = df.reset_index(drop=True)
+    return df, warns
 
-def to_excel_bytes(df):
+def to_excel_bytes(df: pd.DataFrame) -> bytes:
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="SKU_UNIDADES")
     return output.getvalue()
 
-def to_csv_bytes(df):
+def to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8")
 
 uploaded = st.file_uploader("Envie o PDF", type=["pdf"])
@@ -85,7 +177,7 @@ if uploaded:
         st.warning(w)
 
     if not df.empty:
-        st.subheader("Pré-visualização")
+        st.subheader("Pré-visualização (na ordem do PDF)")
         st.dataframe(df, use_container_width=True)
 
         col1, col2 = st.columns(2)
