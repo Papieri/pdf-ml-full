@@ -14,34 +14,68 @@ SKU_REGEX = re.compile(r"SKU:\s*([A-Za-z0-9]+)", re.IGNORECASE)
 def parse_pdf(file_bytes: bytes) -> pd.DataFrame:
     rows = []
 
-    def extract_units_from_tail(page_text: str) -> list[int]:
-        if not page_text:
-            return []
+    def is_sku_token(tok: str) -> bool:
+        # SKU precisa ter pelo menos 1 letra e 1 número (evita pegar "3", "2", etc.)
+        return bool(re.fullmatch(r"(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9]+", tok))
 
-        up = page_text.upper()
-        idx = up.rfind("PRODUTO UNIDADES")
-        if idx == -1:
-            # fallback: tenta achar pelo menos "UNIDADES"
-            idx = up.rfind("UNIDADES")
-            if idx == -1:
-                return []
+    def extract_short_int_after(label: str, line: str):
+        """
+        Pega número curto (1-4 dígitos) após um label. Ex:
+        'SKU: 3 Etiquetagem' -> 3
+        'Código universal: 360 Etiquetagem' -> 360
+        """
+        m = re.search(label + r"\s*([0-9]{1,4})\b", line, flags=re.IGNORECASE)
+        return int(m.group(1)) if m else None
 
-        tail = page_text[idx:]
+    with pdfplumber.open(BytesIO(file_bytes)) as pdf:
+        for page_idx, page in enumerate(pdf.pages, start=1):
+            text = page.extract_text() or ""
+            lines = [l.strip() for l in text.splitlines() if l.strip()]
 
-        units = []
-        for line in tail.splitlines():
-            s = line.strip()
+            pending_units = None        # unidade associada ao próximo SKU
+            waiting_sku_code = False    # estamos esperando encontrar o SKU real
 
-            # pega linhas que são APENAS números (1 a 4 dígitos) => evita código universal e números de descrição
-            if re.fullmatch(r"\d{1,4}", s):
-                units.append(int(s))
-                continue
+            for line in lines:
+                # 1) Às vezes a UNIDADE aparece colada em "Código universal:" (número curto)
+                u_from_universal = extract_short_int_after(r"C[óo]digo\s+universal:\s*", line)
+                if u_from_universal is not None:
+                    pending_units = u_from_universal
 
-            # também aceita linha com "números separados por espaço" e nada mais (ex: "3 2 360")
-            if s and re.fullmatch(r"(?:\d{1,4}\s+)+\d{1,4}", s):
-                units.extend([int(x) for x in s.split()])
+                # 2) Detectou "SKU:" -> começa um bloco de produto
+                if re.search(r"\bSKU:\b", line, flags=re.IGNORECASE):
+                    waiting_sku_code = True
 
-        return units
+                    # 2a) Se vier "SKU: 3 ..." pega essa unidade
+                    u_from_sku = extract_short_int_after(r"SKU:\s*", line)
+                    if u_from_sku is not None:
+                        pending_units = u_from_sku
+
+                    # 2b) Às vezes o SKU real vem na mesma linha após "SKU:"
+                    after = re.split(r"SKU:\s*", line, flags=re.IGNORECASE, maxsplit=1)
+                    if len(after) == 2:
+                        tail = after[1]
+                        # pega tokens e procura o primeiro que parece SKU real
+                        for tok in re.findall(r"[A-Za-z0-9]+", tail):
+                            if is_sku_token(tok) and tok.lower() not in {"obrigatoria", "obrigatório"}:
+                                rows.append({"page": page_idx, "sku": tok, "unidades": pending_units})
+                                pending_units = None
+                                waiting_sku_code = False
+                                break
+
+                    continue  # já tratou esta linha
+
+                # 3) Se estamos esperando SKU real, ele costuma vir na linha seguinte (ex: "CX81X20 obrigatória")
+                if waiting_sku_code:
+                    # primeiro token alfanumérico da linha
+                    toks = re.findall(r"[A-Za-z0-9]+", line)
+                    if toks:
+                        tok0 = toks[0]
+                        if is_sku_token(tok0):
+                            rows.append({"page": page_idx, "sku": tok0, "unidades": pending_units})
+                            pending_units = None
+                            waiting_sku_code = False
+
+    return pd.DataFrame(rows)
 
     with pdfplumber.open(BytesIO(file_bytes)) as pdf:
         for page_idx, page in enumerate(pdf.pages, start=1):
