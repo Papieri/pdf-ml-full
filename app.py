@@ -11,29 +11,56 @@ st.write("Extrai **SKU** e **UNIDADES** mantendo a **ordem do PDF**.")
 
 SKU_REGEX = re.compile(r"SKU:\s*([A-Za-z0-9]+)", re.IGNORECASE)
 
-
 def parse_pdf(file_bytes: bytes) -> pd.DataFrame:
     rows = []
+
+    def extract_units_from_tail(page_text: str) -> list[int]:
+        if not page_text:
+            return []
+
+        up = page_text.upper()
+        idx = up.rfind("PRODUTO UNIDADES")
+        if idx == -1:
+            # fallback: tenta achar pelo menos "UNIDADES"
+            idx = up.rfind("UNIDADES")
+            if idx == -1:
+                return []
+
+        tail = page_text[idx:]
+
+        units = []
+        for line in tail.splitlines():
+            s = line.strip()
+
+            # pega linhas que são APENAS números (1 a 4 dígitos) => evita código universal e números de descrição
+            if re.fullmatch(r"\d{1,4}", s):
+                units.append(int(s))
+                continue
+
+            # também aceita linha com "números separados por espaço" e nada mais (ex: "3 2 360")
+            if s and re.fullmatch(r"(?:\d{1,4}\s+)+\d{1,4}", s):
+                units.extend([int(x) for x in s.split()])
+
+        return units
 
     with pdfplumber.open(BytesIO(file_bytes)) as pdf:
         for page_idx, page in enumerate(pdf.pages, start=1):
             text = page.extract_text() or ""
-            lines = [l.strip() for l in text.splitlines() if l.strip()]
 
-            current_sku = None
+            # SKUs na ordem em que aparecem na página
+            skus = [m.group(1).strip() for m in SKU_REGEX.finditer(text)]
+            if not skus:
+                continue
 
-            for line in lines:
-                m = SKU_REGEX.search(line)
-                if m:
-                    current_sku = m.group(1).strip()
-                    continue
+            # UNIDADES extraídas do trecho do rodapé/tabela
+            units = extract_units_from_tail(text)
 
-                if current_sku and re.fullmatch(r"\d{1,4}", line):
-                    rows.append({"page": page_idx, "sku": current_sku, "unidades": int(line)})
-                    current_sku = None
+            # pareamento por posição (mantém ordem do PDF)
+            for i, sku in enumerate(skus):
+                unidade = units[i] if i < len(units) else None
+                rows.append({"page": page_idx, "sku": sku, "unidades": unidade})
 
     return pd.DataFrame(rows)
-
 
 def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
     buf = BytesIO()
