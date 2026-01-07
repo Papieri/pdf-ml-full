@@ -17,62 +17,79 @@ st.caption("O app gera um Markdown interno a partir do PDF e converte para CSV/X
 # -----------------------------
 SKU_RE = re.compile(r"SKU:\s*([A-Za-z0-9]+)", re.IGNORECASE)
 
-def extract_units_from_tail(page_text: str) -> List[int]:
+def extract_units_from_tail(page_text: str) -> list[int]:
     """
-    Extrai UNIDADES do trecho após 'PRODUTO UNIDADES', preservando ordem.
-    Aceita:
-      - linha com vários números: '3 2 360'
-      - linha começando com número: '12 • Embale ...'
+    Extrai UNIDADES do trecho após o cabeçalho 'PRODUTO UNIDADES' (com regex flexível).
+    - Aceita 'PRODUTO  UNIDADES', 'PRODUTO\\nUNIDADES', etc.
+    - Extrai números (1-4 dígitos) no início da linha (mesmo que venha '12 • ...')
+    - Ou linhas com vários números '3 2 360'
     """
     if not page_text:
         return []
 
-    up = page_text.upper()
-    idx = up.rfind("PRODUTO UNIDADES")
-    if idx == -1:
+    # acha a ÚLTIMA ocorrência do cabeçalho (mais seguro)
+    header_pat = re.compile(r"PRODUTO\s+UNIDADES", re.IGNORECASE)
+    matches = list(header_pat.finditer(page_text))
+    if not matches:
         return []
 
+    idx = matches[-1].start()
     tail = page_text[idx:]
-    units: List[int] = []
+
+    units: list[int] = []
 
     for line in tail.splitlines():
         s = line.strip()
         if not s:
             continue
 
+        # linha com vários números (ex: "3 2 360")
         if re.fullmatch(r"(?:\d{1,4}\s+)+\d{1,4}", s):
             units.extend([int(x) for x in s.split()])
             continue
 
+        # número no começo da linha (ex: "12 • Embale ...")
         m = re.match(r"^(\d{1,4})\b", s)
         if m:
             units.append(int(m.group(1)))
 
     return units
 
-def pdf_to_pairs(file_bytes: bytes) -> Tuple[List[Tuple[str, int]], dict]:
-    pairs: List[Tuple[str, int]] = []
-    diag = {"pages": 0, "mismatch_pages": []}
+def pdf_to_pairs(file_bytes: bytes) -> tuple[list[tuple[str, int]], dict]:
+    pairs: list[tuple[str, int]] = []
+    diag = {"pages": 0, "per_page": []}
 
     with pdfplumber.open(BytesIO(file_bytes)) as pdf:
         diag["pages"] = len(pdf.pages)
 
         for page_idx, page in enumerate(pdf.pages, start=1):
             text = page.extract_text() or ""
+
+            # SKUs em ordem
             skus = [m.group(1).strip() for m in SKU_RE.finditer(text)]
+
+            # UNIDADES em ordem
             units = extract_units_from_tail(text)
 
+            # fallback: se não achou nada por cabeçalho, tenta pegar números soltos no final (1–4 dígitos)
+            # (ajuda quando o cabeçalho vem “muito torto”)
+            if not units and skus:
+                tail_nums = re.findall(r"\b\d{1,4}\b", text)
+                units = [int(x) for x in tail_nums[-len(skus):]] if len(tail_nums) >= 1 else []
+
+            # Se vier unidades a mais, corta; se vier a menos, preenche com None (para você ver onde falhou)
             m = min(len(skus), len(units))
             for i in range(m):
                 pairs.append((skus[i], units[i]))
 
-            if len(skus) != len(units):
-                diag["mismatch_pages"].append(
-                    {"page": page_idx, "skus": len(skus), "units": len(units)}
-                )
+            diag["per_page"].append({
+                "page": page_idx,
+                "skus": len(skus),
+                "units": len(units),
+                "paired": m
+            })
 
     return pairs, diag
-
 
 # -----------------------------
 # Markdown (gerar e "executar")
