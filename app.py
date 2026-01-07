@@ -16,10 +16,56 @@ SKU_RE = re.compile(r"SKU:\s*([A-Za-z0-9]+)", re.IGNORECASE)
 # Cabeçalho flexível (aceita espaços e quebras de linha)
 HEADER_RE = re.compile(r"PRODUTO\s+UNIDADES", re.IGNORECASE)
 
+SKU_TOKEN_RE = re.compile(r"^(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9]+$")
 
-def extract_skus(page_text: str) -> List[str]:
-    return [m.group(1).strip() for m in SKU_RE.finditer(page_text or "")]
+def extract_skus_from_page(page) -> list[str]:
+    """
+    Extrai SKUs na ordem visual da página usando extract_words.
+    Regra: após 'SKU' ou 'SKU:' pegar o próximo token que contenha letra+numero.
+    Se vier 'SKU: 3', ignora '3' e continua até achar 'CX81X20'.
+    """
+    words = page.extract_words(use_text_flow=True, keep_blank_chars=False) or []
+    if not words:
+        return []
 
+    # Ordena de cima pra baixo, esquerda pra direita (ordem do documento)
+    words.sort(key=lambda w: (float(w["top"]), float(w["x0"])))
+
+    skus = []
+    pending = False
+    lookahead = 0
+
+    for w in words:
+        t = (w.get("text") or "").strip()
+        if not t:
+            continue
+
+        upper = t.upper()
+
+        # Detecta o marcador SKU
+        if upper in ("SKU", "SKU:") or upper.startswith("SKU:"):
+            pending = True
+            lookahead = 0
+            continue
+
+        if pending:
+            lookahead += 1
+
+            # para não “viajar” demais (caso não encontre SKU perto)
+            if lookahead > 20:
+                pending = False
+                continue
+
+            # ignora tokens numéricos (são as UNIDADES ou outros números)
+            if t.isdigit():
+                continue
+
+            # aceita somente SKU com letra+numero
+            if SKU_TOKEN_RE.match(t):
+                skus.append(t)
+                pending = False
+
+    return skus
 
 def extract_units_from_tail(page_text: str) -> List[int]:
     """
@@ -116,7 +162,7 @@ def pdf_to_pairs(file_bytes: bytes) -> Tuple[List[Tuple[str, int]], Dict[str, An
         for page_idx, page in enumerate(pdf.pages, start=1):
             text = page.extract_text() or ""
 
-            skus = extract_skus(text)
+            skus = extract_skus_from_page(page)
             units = extract_units_by_column(page)
             if not units:
             # fallback pro método antigo se por algum motivo não achar a coluna
