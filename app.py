@@ -57,6 +57,54 @@ def extract_units_from_tail(page_text: str) -> List[int]:
 
     return units
 
+def extract_units_by_column(page) -> list[int]:
+    """
+    Pega UNIDADES usando coordenadas: encontra o cabeçalho 'UNIDADES' e coleta
+    números (1–4 dígitos) na mesma faixa X abaixo do cabeçalho, ordenados por Y.
+    """
+    words = page.extract_words(use_text_flow=True, keep_blank_chars=False) or []
+    if not words:
+        return []
+
+    # acha a palavra UNIDADES no cabeçalho
+    header = None
+    for w in words:
+        if (w.get("text") or "").strip().upper() == "UNIDADES":
+            header = w
+            break
+    if header is None:
+        return []
+
+    x0 = float(header["x0"])
+    x1 = float(header["x1"])
+    header_bottom = float(header["bottom"])
+
+    # tolerância para pegar números alinhados na coluna (varia conforme fonte/layout)
+    pad_left = 25.0
+    pad_right = 40.0
+    xmin = x0 - pad_left
+    xmax = x1 + pad_right
+
+    candidates = []
+    for w in words:
+        t = (w.get("text") or "").strip()
+        if not t.isdigit():
+            continue
+        if len(t) > 4:
+            continue
+
+        wx0 = float(w["x0"])
+        wx1 = float(w["x1"])
+        wtop = float(w["top"])
+        wbottom = float(w["bottom"])
+
+        # abaixo do cabeçalho e dentro da faixa X da coluna
+        if wbottom > header_bottom and wx0 >= xmin and wx1 <= xmax:
+            candidates.append((wtop, wx0, int(t)))
+
+    # ordena na ordem visual (de cima pra baixo)
+    candidates.sort(key=lambda a: (a[0], a[1]))
+    return [u for _, __, u in candidates]
 
 def pdf_to_pairs(file_bytes: bytes) -> Tuple[List[Tuple[str, int]], Dict[str, Any]]:
     pairs: List[Tuple[str, int]] = []
@@ -69,7 +117,11 @@ def pdf_to_pairs(file_bytes: bytes) -> Tuple[List[Tuple[str, int]], Dict[str, An
             text = page.extract_text() or ""
 
             skus = extract_skus(text)
-            units = extract_units_from_tail(text)
+            units = extract_units_by_column(page)
+            if not units:
+            # fallback pro método antigo se por algum motivo não achar a coluna
+                units = extract_units_from_tail(text)
+
 
             paired = min(len(skus), len(units))
             for i in range(paired):
